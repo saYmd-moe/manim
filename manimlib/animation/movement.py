@@ -1,5 +1,16 @@
+from __future__ import annotations
+
 from manimlib.animation.animation import Animation
 from manimlib.utils.rate_functions import linear
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Callable, Sequence
+
+    import numpy as np
+
+    from manimlib.mobject.mobject import Mobject
 
 
 class Homotopy(Animation):
@@ -8,7 +19,12 @@ class Homotopy(Animation):
         "apply_function_kwargs": {},
     }
 
-    def __init__(self, homotopy, mobject, **kwargs):
+    def __init__(
+        self,
+        homotopy: Callable[[float, float, float, float], Sequence[float]],
+        mobject: Mobject,
+        **kwargs
+    ):
         """
         Homotopy is a function from
         (x, y, z, t) to (x', y', z')
@@ -16,11 +32,19 @@ class Homotopy(Animation):
         self.homotopy = homotopy
         super().__init__(mobject, **kwargs)
 
-    def function_at_time_t(self, t):
+    def function_at_time_t(
+        self,
+        t: float
+    ) -> Callable[[np.ndarray], Sequence[float]]:
         return lambda p: self.homotopy(*p, t)
 
-    def interpolate_submobject(self, submob, start, alpha):
-        submob.points = start.points
+    def interpolate_submobject(
+        self,
+        submob: Mobject,
+        start: Mobject,
+        alpha: float
+    ) -> None:
+        submob.match_points(start)
         submob.apply_function(
             self.function_at_time_t(alpha),
             **self.apply_function_kwargs
@@ -28,20 +52,27 @@ class Homotopy(Animation):
 
 
 class SmoothedVectorizedHomotopy(Homotopy):
-    def interpolate_submobject(self, submob, start, alpha):
-        Homotopy.interpolate_submobject(self, submob, start, alpha)
-        submob.make_smooth()
+    CONFIG = {
+        "apply_function_kwargs": {"make_smooth": True},
+    }
 
 
 class ComplexHomotopy(Homotopy):
-    def __init__(self, complex_homotopy, mobject, **kwargs):
+    def __init__(
+        self,
+        complex_homotopy: Callable[[complex, float], Sequence[float]],
+        mobject: Mobject,
+        **kwargs
+    ):
         """
-        Complex Hootopy a function Cx[0, 1] to C
+        Given a function form (z, t) -> w, where z and w
+        are complex numbers and t is time, this animates
+        the state over time
         """
         def homotopy(x, y, z, t):
             c = complex_homotopy(complex(x, y), t)
             return (c.real, c.imag, z)
-        Homotopy.__init__(self, homotopy, mobject, **kwargs)
+        super().__init__(homotopy, mobject, **kwargs)
 
 
 class PhaseFlow(Animation):
@@ -51,11 +82,16 @@ class PhaseFlow(Animation):
         "suspend_mobject_updating": False,
     }
 
-    def __init__(self, function, mobject, **kwargs):
+    def __init__(
+        self,
+        function: Callable[[np.ndarray], np.ndarray],
+        mobject: Mobject,
+        **kwargs
+    ):
         self.function = function
         super().__init__(mobject, **kwargs)
 
-    def interpolate_mobject(self, alpha):
+    def interpolate_mobject(self, alpha: float) -> None:
         if hasattr(self, "last_alpha"):
             dt = self.virtual_time * (alpha - self.last_alpha)
             self.mobject.apply_function(
@@ -69,10 +105,10 @@ class MoveAlongPath(Animation):
         "suspend_mobject_updating": False,
     }
 
-    def __init__(self, mobject, path, **kwargs):
+    def __init__(self, mobject: Mobject, path: Mobject, **kwargs):
         self.path = path
         super().__init__(mobject, **kwargs)
 
-    def interpolate_mobject(self, alpha):
+    def interpolate_mobject(self, alpha: float) -> None:
         point = self.path.point_from_proportion(alpha)
         self.mobject.move_to(point)

@@ -1,29 +1,31 @@
-import itertools as it
-import re
-import string
-import warnings
+from __future__ import annotations
 
-from xml.dom import minidom
+import os
+from xml.etree import ElementTree as ET
 
-from manimlib.constants import *
+import numpy as np
+import svgelements as se
+
+from manimlib.constants import RIGHT
+from manimlib.logger import log
 from manimlib.mobject.geometry import Circle
+from manimlib.mobject.geometry import Line
+from manimlib.mobject.geometry import Polygon
+from manimlib.mobject.geometry import Polyline
 from manimlib.mobject.geometry import Rectangle
 from manimlib.mobject.geometry import RoundedRectangle
-from manimlib.mobject.types.vectorized_mobject import VGroup
 from manimlib.mobject.types.vectorized_mobject import VMobject
-from manimlib.utils.color import *
-from manimlib.utils.config_ops import digest_config
-from manimlib.utils.config_ops import digest_locals
+from manimlib.utils.directories import get_mobject_data_dir
+from manimlib.utils.images import get_full_vector_image_path
+from manimlib.utils.iterables import hash_obj
+from manimlib.utils.simple_functions import hash_string
 
 
-def string_to_numbers(num_string):
-    num_string = num_string.replace("-", ",-")
-    num_string = num_string.replace("e,-", "e-")
-    return [
-        float(s)
-        for s in re.split("[ ,]", num_string)
-        if s != ""
-    ]
+SVG_HASH_TO_MOB_MAP: dict[int, VMobject] = {}
+
+
+def _convert_point_to_3d(x: float, y: float) -> np.ndarray:
+    return np.array([x, y, 0.0])
 
 
 class SVGMobject(VMobject):
@@ -31,283 +33,232 @@ class SVGMobject(VMobject):
         "should_center": True,
         "height": 2,
         "width": None,
-        # Must be filled in in a subclass, or when called
         "file_name": None,
-        "unpack_groups": True,  # if False, creates a hierarchy of VGroups
-        "stroke_width": DEFAULT_STROKE_WIDTH,
-        "fill_opacity": 1.0,
-        # "fill_color" : LIGHT_GREY,
+        # Style that overrides the original svg
+        "color": None,
+        "opacity": None,
+        "fill_color": None,
+        "fill_opacity": None,
+        "stroke_width": None,
+        "stroke_color": None,
+        "stroke_opacity": None,
+        # Style that fills only when not specified
+        # If None, regarded as default values from svg standard
+        "svg_default": {
+            "color": None,
+            "opacity": None,
+            "fill_color": None,
+            "fill_opacity": None,
+            "stroke_width": None,
+            "stroke_color": None,
+            "stroke_opacity": None,
+        },
+        "path_string_config": {},
     }
 
-    def __init__(self, file_name=None, **kwargs):
-        digest_config(self, kwargs)
+    def __init__(self, file_name: str | None = None, **kwargs):
+        super().__init__(**kwargs)
         self.file_name = file_name or self.file_name
-        self.ensure_valid_file()
-        VMobject.__init__(self, **kwargs)
+        self.init_svg_mobject()
+        self.init_colors()
         self.move_into_position()
 
-    def ensure_valid_file(self):
-        if self.file_name is None:
-            raise Exception("Must specify file for SVGMobject")
-        possible_paths = [
-            os.path.join(os.path.join("assets", "svg_images"), self.file_name),
-            os.path.join(os.path.join("assets", "svg_images"), self.file_name + ".svg"),
-            os.path.join(os.path.join("assets", "svg_images"), self.file_name + ".xdv"),
-            self.file_name,
-        ]
-        for path in possible_paths:
-            if os.path.exists(path):
-                self.file_path = path
-                return
-        raise IOError("No file matching %s in image directory" %
-                      self.file_name)
+    def init_svg_mobject(self) -> None:
+        hash_val = hash_obj(self.hash_seed)
+        if hash_val in SVG_HASH_TO_MOB_MAP:
+            mob = SVG_HASH_TO_MOB_MAP[hash_val].copy()
+            self.add(*mob)
+            return
 
-    def generate_points(self):
-        doc = minidom.parse(self.file_path)
-        self.ref_to_element = {}
-        for svg in doc.getElementsByTagName("svg"):
-            mobjects = self.get_mobjects_from(svg)
-            if self.unpack_groups:
-                self.add(*mobjects)
-            else:
-                self.add(*mobjects[0].submobjects)
-        doc.unlink()
+        self.generate_mobject()
+        SVG_HASH_TO_MOB_MAP[hash_val] = self.copy()
 
-    def get_mobjects_from(self, element):
-        result = []
-        if not isinstance(element, minidom.Element):
-            return result
-        if element.tagName == 'defs':
-            self.update_ref_to_element(element)
-        elif element.tagName == 'style':
-            pass  # TODO, handle style
-        elif element.tagName in ['g', 'svg', 'symbol']:
-            result += it.chain(*[
-                self.get_mobjects_from(child)
-                for child in element.childNodes
-            ])
-        elif element.tagName == 'path':
-            temp = element.getAttribute('d')
-            if temp != '':
-                result.append(self.path_string_to_mobject(temp))
-        elif element.tagName == 'use':
-            result += self.use_to_mobjects(element)
-        elif element.tagName == 'rect':
-            result.append(self.rect_to_mobject(element))
-        elif element.tagName == 'circle':
-            result.append(self.circle_to_mobject(element))
-        elif element.tagName == 'ellipse':
-            result.append(self.ellipse_to_mobject(element))
-        elif element.tagName in ['polygon', 'polyline']:
-            result.append(self.polygon_to_mobject(element))
-        else:
-            pass  # TODO
-            # warnings.warn("Unknown element type: " + element.tagName)
-        result = [m for m in result if m is not None]
-        self.handle_transforms(element, VGroup(*result))
-        if len(result) > 1 and not self.unpack_groups:
-            result = [VGroup(*result)]
-
-        return result
-
-    def g_to_mobjects(self, g_element):
-        mob = VGroup(*self.get_mobjects_from(g_element))
-        self.handle_transforms(g_element, mob)
-        return mob.submobjects
-
-    def path_string_to_mobject(self, path_string):
-        return VMobjectFromSVGPathstring(path_string)
-
-    def use_to_mobjects(self, use_element):
-        # Remove initial "#" character
-        ref = use_element.getAttribute("xlink:href")[1:]
-        if ref not in self.ref_to_element:
-            warnings.warn("%s not recognized" % ref)
-            return VGroup()
-        return self.get_mobjects_from(
-            self.ref_to_element[ref]
+    @property
+    def hash_seed(self) -> tuple:
+        # Returns data which can uniquely represent the result of `init_points`.
+        # The hashed value of it is stored as a key in `SVG_HASH_TO_MOB_MAP`.
+        return (
+            self.__class__.__name__,
+            self.svg_default,
+            self.path_string_config,
+            self.file_name
         )
 
-    def attribute_to_float(self, attr):
-        stripped_attr = "".join([
-            char for char in attr
-            if char in string.digits + "." + "-"
+    def generate_mobject(self) -> None:
+        file_path = self.get_file_path()
+        element_tree = ET.parse(file_path)
+        new_tree = self.modify_xml_tree(element_tree)
+        # Create a temporary svg file to dump modified svg to be parsed
+        root, ext = os.path.splitext(file_path)
+        modified_file_path = root + "_" + ext
+        new_tree.write(modified_file_path)
+
+        svg = se.SVG.parse(modified_file_path)
+        os.remove(modified_file_path)
+
+        mobjects = self.get_mobjects_from(svg)
+        self.add(*mobjects)
+        self.flip(RIGHT)  # Flip y
+
+    def get_file_path(self) -> str:
+        if self.file_name is None:
+            raise Exception("Must specify file for SVGMobject")
+        return get_full_vector_image_path(self.file_name)
+
+    def modify_xml_tree(self, element_tree: ET.ElementTree) -> ET.ElementTree:
+        config_style_attrs = self.generate_config_style_dict()
+        style_keys = (
+            "fill",
+            "fill-opacity",
+            "stroke",
+            "stroke-opacity",
+            "stroke-width",
+            "style"
+        )
+        root = element_tree.getroot()
+        style_attrs = {
+            k: v
+            for k, v in root.attrib.items()
+            if k in style_keys
+        }
+
+        # Ignore other attributes in case that svgelements cannot parse them
+        SVG_XMLNS = "{http://www.w3.org/2000/svg}"
+        new_root = ET.Element("svg")
+        config_style_node = ET.SubElement(new_root, f"{SVG_XMLNS}g", config_style_attrs)
+        root_style_node = ET.SubElement(config_style_node, f"{SVG_XMLNS}g", style_attrs)
+        root_style_node.extend(root)
+        return ET.ElementTree(new_root)
+
+    def generate_config_style_dict(self) -> dict[str, str]:
+        keys_converting_dict = {
+            "fill": ("color", "fill_color"),
+            "fill-opacity": ("opacity", "fill_opacity"),
+            "stroke": ("color", "stroke_color"),
+            "stroke-opacity": ("opacity", "stroke_opacity"),
+            "stroke-width": ("stroke_width",)
+        }
+        svg_default_dict = self.svg_default
+        result = {}
+        for svg_key, style_keys in keys_converting_dict.items():
+            for style_key in style_keys:
+                if svg_default_dict[style_key] is None:
+                    continue
+                result[svg_key] = str(svg_default_dict[style_key])
+        return result
+
+    def get_mobjects_from(self, svg: se.SVG) -> list[VMobject]:
+        result = []
+        for shape in svg.elements():
+            if isinstance(shape, (se.Group, se.Use)):
+                continue
+            elif isinstance(shape, se.Path):
+                mob = self.path_to_mobject(shape)
+            elif isinstance(shape, se.SimpleLine):
+                mob = self.line_to_mobject(shape)
+            elif isinstance(shape, se.Rect):
+                mob = self.rect_to_mobject(shape)
+            elif isinstance(shape, (se.Circle, se.Ellipse)):
+                mob = self.ellipse_to_mobject(shape)
+            elif isinstance(shape, se.Polygon):
+                mob = self.polygon_to_mobject(shape)
+            elif isinstance(shape, se.Polyline):
+                mob = self.polyline_to_mobject(shape)
+            # elif isinstance(shape, se.Text):
+            #     mob = self.text_to_mobject(shape)
+            elif type(shape) == se.SVGElement:
+                continue
+            else:
+                log.warning("Unsupported element type: %s", type(shape))
+                continue
+            if not mob.has_points():
+                continue
+            if isinstance(shape, se.GraphicObject):
+                self.apply_style_to_mobject(mob, shape)
+            if isinstance(shape, se.Transformable) and shape.apply:
+                self.handle_transform(mob, shape.transform)
+            result.append(mob)
+        return result
+
+    @staticmethod
+    def handle_transform(mob: VMobject, matrix: se.Matrix) -> VMobject:
+        mat = np.array([
+            [matrix.a, matrix.c],
+            [matrix.b, matrix.d]
         ])
-        return float(stripped_attr)
+        vec = np.array([matrix.e, matrix.f, 0.0])
+        mob.apply_matrix(mat)
+        mob.shift(vec)
+        return mob
 
-    def polygon_to_mobject(self, polygon_element):
-        # TODO, This seems hacky...
-        path_string = polygon_element.getAttribute("points")
-        for digit in string.digits:
-            path_string = path_string.replace(" " + digit, " L" + digit)
-        path_string = "M" + path_string
-        return self.path_string_to_mobject(path_string)
+    @staticmethod
+    def apply_style_to_mobject(
+        mob: VMobject,
+        shape: se.GraphicObject
+    ) -> VMobject:
+        mob.set_style(
+            stroke_width=shape.stroke_width,
+            stroke_color=shape.stroke.hexrgb,
+            stroke_opacity=shape.stroke.opacity,
+            fill_color=shape.fill.hexrgb,
+            fill_opacity=shape.fill.opacity
+        )
+        return mob
 
-    # <circle class="st1" cx="143.8" cy="268" r="22.6"/>
+    def path_to_mobject(self, path: se.Path) -> VMobjectFromSVGPath:
+        return VMobjectFromSVGPath(path, **self.path_string_config)
 
-    def circle_to_mobject(self, circle_element):
-        x, y, r = [
-            self.attribute_to_float(
-                circle_element.getAttribute(key)
-            )
-            if circle_element.hasAttribute(key)
-            else 0.0
-            for key in ("cx", "cy", "r")
-        ]
-        return Circle(radius=r).shift(x * RIGHT + y * DOWN)
+    def line_to_mobject(self, line: se.SimpleLine) -> Line:
+        return Line(
+            start=_convert_point_to_3d(line.x1, line.y1),
+            end=_convert_point_to_3d(line.x2, line.y2)
+        )
 
-    def ellipse_to_mobject(self, circle_element):
-        x, y, rx, ry = [
-            self.attribute_to_float(
-                circle_element.getAttribute(key)
-            )
-            if circle_element.hasAttribute(key)
-            else 0.0
-            for key in ("cx", "cy", "rx", "ry")
-        ]
-        return Circle().scale(rx * RIGHT + ry * UP).shift(x * RIGHT + y * DOWN)
-
-    def rect_to_mobject(self, rect_element):
-        fill_color = rect_element.getAttribute("fill")
-        stroke_color = rect_element.getAttribute("stroke")
-        stroke_width = rect_element.getAttribute("stroke-width")
-        corner_radius = rect_element.getAttribute("rx")
-
-        # input preprocessing
-        if fill_color in ["", "none", "#FFF", "#FFFFFF"] or Color(fill_color) == Color(WHITE):
-            opacity = 0
-            fill_color = BLACK  # shdn't be necessary but avoids error msgs
-        if fill_color in ["#000", "#000000"]:
-            fill_color = WHITE
-        if stroke_color in ["", "none", "#FFF", "#FFFFFF"] or Color(stroke_color) == Color(WHITE):
-            stroke_width = 0
-            stroke_color = BLACK
-        if stroke_color in ["#000", "#000000"]:
-            stroke_color = WHITE
-        if stroke_width in ["", "none", "0"]:
-            stroke_width = 0
-
-        if corner_radius in ["", "0", "none"]:
-            corner_radius = 0
-
-        corner_radius = float(corner_radius)
-
-        if corner_radius == 0:
+    def rect_to_mobject(self, rect: se.Rect) -> Rectangle:
+        if rect.rx == 0 or rect.ry == 0:
             mob = Rectangle(
-                width=self.attribute_to_float(
-                    rect_element.getAttribute("width")
-                ),
-                height=self.attribute_to_float(
-                    rect_element.getAttribute("height")
-                ),
-                stroke_width=stroke_width,
-                stroke_color=stroke_color,
-                fill_color=fill_color,
-                fill_opacity=opacity
+                width=rect.width,
+                height=rect.height,
             )
         else:
             mob = RoundedRectangle(
-                width=self.attribute_to_float(
-                    rect_element.getAttribute("width")
-                ),
-                height=self.attribute_to_float(
-                    rect_element.getAttribute("height")
-                ),
-                stroke_width=stroke_width,
-                stroke_color=stroke_color,
-                fill_color=fill_color,
-                fill_opacity=opacity,
-                corner_radius=corner_radius
+                width=rect.width,
+                height=rect.height * rect.rx / rect.ry,
+                corner_radius=rect.rx
             )
-
-        mob.shift(mob.get_center() - mob.get_corner(UP + LEFT))
+            mob.stretch_to_fit_height(rect.height)
+        mob.shift(_convert_point_to_3d(
+            rect.x + rect.width / 2,
+            rect.y + rect.height / 2
+        ))
         return mob
 
-    def handle_transforms(self, element, mobject):
-        x, y = 0, 0
-        try:
-            x = self.attribute_to_float(element.getAttribute('x'))
-            # Flip y
-            y = -self.attribute_to_float(element.getAttribute('y'))
-            mobject.shift(x * RIGHT + y * UP)
-        except:
-            pass
+    def ellipse_to_mobject(self, ellipse: se.Circle | se.Ellipse) -> Circle:
+        mob = Circle(radius=ellipse.rx)
+        mob.stretch_to_fit_height(2 * ellipse.ry)
+        mob.shift(_convert_point_to_3d(
+            ellipse.cx, ellipse.cy
+        ))
+        return mob
 
-        transform = element.getAttribute('transform')
+    def polygon_to_mobject(self, polygon: se.Polygon) -> Polygon:
+        points = [
+            _convert_point_to_3d(*point)
+            for point in polygon
+        ]
+        return Polygon(*points)
 
-        try:  # transform matrix
-            prefix = "matrix("
-            suffix = ")"
-            if not transform.startswith(prefix) or not transform.endswith(suffix):
-                raise Exception()
-            transform = transform[len(prefix):-len(suffix)]
-            transform = string_to_numbers(transform)
-            transform = np.array(transform).reshape([3, 2])
-            x = transform[2][0]
-            y = -transform[2][1]
-            matrix = np.identity(self.dim)
-            matrix[:2, :2] = transform[:2, :]
-            matrix[1] *= -1
-            matrix[:, 1] *= -1
+    def polyline_to_mobject(self, polyline: se.Polyline) -> Polyline:
+        points = [
+            _convert_point_to_3d(*point)
+            for point in polyline
+        ]
+        return Polyline(*points)
 
-            for mob in mobject.family_members_with_points():
-                mob.points = np.dot(mob.points, matrix)
-            mobject.shift(x * RIGHT + y * UP)
-        except:
-            pass
+    def text_to_mobject(self, text: se.Text):
+        pass
 
-        try:  # transform scale
-            prefix = "scale("
-            suffix = ")"
-            if not transform.startswith(prefix) or not transform.endswith(suffix):
-                raise Exception()
-            transform = transform[len(prefix):-len(suffix)]
-            scale_values = string_to_numbers(transform)
-            if len(scale_values) == 2:
-                scale_x, scale_y = scale_values
-                mobject.scale(np.array([scale_x, scale_y, 1]), about_point=ORIGIN)
-            elif len(scale_values) == 1:
-                scale = scale_values[0]
-                mobject.scale(np.array([scale, scale, 1]), about_point=ORIGIN)
-        except:
-            pass
-
-        try:  # transform translate
-            prefix = "translate("
-            suffix = ")"
-            if not transform.startswith(prefix) or not transform.endswith(suffix):
-                raise Exception()
-            transform = transform[len(prefix):-len(suffix)]
-            x, y = string_to_numbers(transform)
-            mobject.shift(x * RIGHT + y * DOWN)
-        except:
-            pass
-        # TODO, ...
-
-    def flatten(self, input_list):
-        output_list = []
-        for i in input_list:
-            if isinstance(i, list):
-                output_list.extend(self.flatten(i))
-            else:
-                output_list.append(i)
-        return output_list
-
-    def get_all_childNodes_have_id(self, element):
-        all_childNodes_have_id = []
-        if not isinstance(element, minidom.Element):
-            return
-        if element.hasAttribute('id'):
-            return [element]
-        for e in element.childNodes:
-            all_childNodes_have_id.append(self.get_all_childNodes_have_id(e))
-        return self.flatten([e for e in all_childNodes_have_id if e])
-
-    def update_ref_to_element(self, defs):
-        new_refs = dict([(e.getAttribute('id'), e) for e in self.get_all_childNodes_have_id(defs)])
-        self.ref_to_element.update(new_refs)
-
-    def move_into_position(self):
+    def move_into_position(self) -> None:
         if self.should_center:
             self.center()
         if self.height is not None:
@@ -316,116 +267,61 @@ class SVGMobject(VMobject):
             self.set_width(self.width)
 
 
-class VMobjectFromSVGPathstring(VMobject):
-    def __init__(self, path_string, **kwargs):
-        digest_locals(self)
-        VMobject.__init__(self, **kwargs)
+class VMobjectFromSVGPath(VMobject):
+    CONFIG = {
+        "long_lines": False,
+        "should_subdivide_sharp_curves": False,
+        "should_remove_null_curves": False,
+    }
 
-    def get_path_commands(self):
-        result = [
-            "M",  # moveto
-            "L",  # lineto
-            "H",  # horizontal lineto
-            "V",  # vertical lineto
-            "C",  # curveto
-            "S",  # smooth curveto
-            "Q",  # quadratic Bezier curve
-            "T",  # smooth quadratic Bezier curveto
-            "A",  # elliptical Arc
-            "Z",  # closepath
-        ]
-        result += [s.lower() for s in result]
-        return result
+    def __init__(self, path_obj: se.Path, **kwargs):
+        # Get rid of arcs
+        path_obj.approximate_arcs_with_quads()
+        self.path_obj = path_obj
+        super().__init__(**kwargs)
 
-    def generate_points(self):
-        pattern = "[%s]" % ("".join(self.get_path_commands()))
-        pairs = list(zip(
-            re.findall(pattern, self.path_string),
-            re.split(pattern, self.path_string)[1:]
-        ))
-        # Which mobject should new points be added to
-        self = self
-        for command, coord_string in pairs:
-            self.handle_command(command, coord_string)
-        # people treat y-coordinate differently
-        self.rotate(np.pi, RIGHT, about_point=ORIGIN)
+    def init_points(self) -> None:
+        # After a given svg_path has been converted into points, the result
+        # will be saved to a file so that future calls for the same path
+        # don't need to retrace the same computation.
+        path_string = self.path_obj.d()
+        path_hash = hash_string(path_string)
+        points_filepath = os.path.join(get_mobject_data_dir(), f"{path_hash}_points.npy")
+        tris_filepath = os.path.join(get_mobject_data_dir(), f"{path_hash}_tris.npy")
 
-    def handle_command(self, command, coord_string):
-        isLower = command.islower()
-        command = command.upper()
-        # new_points are the points that will be added to the curr_points
-        # list. This variable may get modified in the conditionals below.
-        points = self.points
-        new_points = self.string_to_points(coord_string)
+        if os.path.exists(points_filepath) and os.path.exists(tris_filepath):
+            self.set_points(np.load(points_filepath))
+            self.triangulation = np.load(tris_filepath)
+            self.needs_new_triangulation = False
+        else:
+            self.handle_commands()
+            if self.should_subdivide_sharp_curves:
+                # For a healthy triangulation later
+                self.subdivide_sharp_curves()
+            if self.should_remove_null_curves:
+                # Get rid of any null curves
+                self.set_points(self.get_points_without_null_curves())
+            # Save to a file for future use
+            np.save(points_filepath, self.get_points())
+            np.save(tris_filepath, self.get_triangulation())
 
-        if isLower and len(points) > 0:
-            new_points += points[-1]
+    def handle_commands(self) -> None:
+        segment_class_to_func_map = {
+            se.Move: (self.start_new_path, ("end",)),
+            se.Close: (self.close_path, ()),
+            se.Line: (self.add_line_to, ("end",)),
+            se.QuadraticBezier: (self.add_quadratic_bezier_curve_to, ("control", "end")),
+            se.CubicBezier: (self.add_cubic_bezier_curve_to, ("control1", "control2", "end"))
+        }
+        for segment in self.path_obj:
+            segment_class = segment.__class__
+            func, attr_names = segment_class_to_func_map[segment_class]
+            points = [
+                _convert_point_to_3d(*segment.__getattribute__(attr_name))
+                for attr_name in attr_names
+            ]
+            func(*points)
 
-        if command == "M":  # moveto
-            self.start_new_path(new_points[0])
-            if len(new_points) <= 1:
-                return
-
-            # Draw relative line-to values.
-            points = self.points
-            new_points = new_points[1:]
-            command = "L"
-
-            for p in new_points:
-                if isLower:
-                    # Treat everything as relative line-to until empty
-                    p[0] += self.points[-1, 0]
-                    p[1] += self.points[-1, 1]
-                self.add_line_to(p)
-            return
-
-        elif command in ["L", "H", "V"]:  # lineto
-            if command == "H":
-                new_points[0, 1] = points[-1, 1]
-            elif command == "V":
-                if isLower:
-                    new_points[0, 0] -= points[-1, 0]
-                    new_points[0, 0] += points[-1, 1]
-                new_points[0, 1] = new_points[0, 0]
-                new_points[0, 0] = points[-1, 0]
-            self.add_line_to(new_points[0])
-            return
-
-        if command == "C":  # curveto
-            pass  # Yay! No action required
-        elif command in ["S", "T"]:  # smooth curveto
-            self.add_smooth_curve_to(*new_points)
-            # handle1 = points[-1] + (points[-1] - points[-2])
-            # new_points = np.append([handle1], new_points, axis=0)
-            return
-        elif command == "Q":  # quadratic Bezier curve
-            # TODO, this is a suboptimal approximation
-            new_points = np.append([new_points[0]], new_points, axis=0)
-        elif command == "A":  # elliptical Arc
-            raise Exception("Not implemented")
-        elif command == "Z":  # closepath
-            return
-
-        # Add first three points
-        self.add_cubic_bezier_curve_to(*new_points[0:3])
-
-        # Handle situations where there's multiple relative control points
-        if len(new_points) > 3:
-            # Add subsequent offset points relatively.
-            for i in range(3, len(new_points), 3):
-                if isLower:
-                    new_points[i:i + 3] -= points[-1]
-                    new_points[i:i + 3] += new_points[i - 1]
-                self.add_cubic_bezier_curve_to(*new_points[i:i+3])
-
-    def string_to_points(self, coord_string):
-        numbers = string_to_numbers(coord_string)
-        if len(numbers) % 2 == 1:
-            numbers.append(0)
-        num_points = len(numbers) // 2
-        result = np.zeros((num_points, self.dim))
-        result[:, :2] = np.array(numbers).reshape((num_points, 2))
-        return result
-
-    def get_original_path_string(self):
-        return self.path_string
+        # Get rid of the side effect of trailing "Z M" commands.
+        if self.has_new_path_started():
+            self.resize_points(self.get_num_points() - 1)

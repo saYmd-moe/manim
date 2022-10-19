@@ -1,47 +1,57 @@
+from __future__ import annotations
+
+from collections import OrderedDict
+from functools import wraps
 import inspect
-import random
-import warnings
+import os
 import platform
+import pyperclip
+import random
+import time
 
-from tqdm import tqdm as ProgressDisplay
 import numpy as np
+from tqdm import tqdm as ProgressDisplay
 
-from manimlib.animation.animation import Animation
-from manimlib.animation.transform import MoveToTarget, ApplyMethod
+from manimlib.animation.animation import prepare_animation
 from manimlib.camera.camera import Camera
-from manimlib.constants import *
-from manimlib.container.container import Container
+from manimlib.constants import ARROW_SYMBOLS
+from manimlib.constants import DEFAULT_WAIT_TIME
+from manimlib.constants import COMMAND_MODIFIER
+from manimlib.constants import SHIFT_MODIFIER
+from manimlib.event_handler import EVENT_DISPATCHER
+from manimlib.event_handler.event_type import EventType
+from manimlib.logger import log
+from manimlib.mobject.mobject import _AnimationBuilder
+from manimlib.mobject.mobject import Group
 from manimlib.mobject.mobject import Mobject
+from manimlib.mobject.mobject import Point
+from manimlib.mobject.types.vectorized_mobject import VGroup
+from manimlib.mobject.types.vectorized_mobject import VMobject
 from manimlib.scene.scene_file_writer import SceneFileWriter
-from manimlib.utils.iterables import list_update
+from manimlib.utils.config_ops import digest_config
+from manimlib.utils.family_ops import extract_mobject_family_members
+from manimlib.utils.iterables import list_difference_update
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Callable, Iterable
+
+    from PIL.Image import Image
+
+    from manimlib.animation.animation import Animation
 
 
-class Scene(Container):
-    """
-    A Scene can be thought of as the Canvas of your animation.
-    All of your own named Scenes will be subclasses of this Scene, or
-    other named scenes.
+PAN_3D_KEY = 'd'
+FRAME_SHIFT_KEY = 'f'
+ZOOM_KEY = 'z'
+RESET_FRAME_KEY = 'r'
+QUIT_KEY = 'q'
 
-    Use a construct() function to tell Manim what should go on in the Scene.
-    
-    E.G:
-        
-        class MyScene(Scene):
-            def construct(self):
-                self.play(
-                    Write(Text("Hello World!"))
-                )
 
-    Some important variables to note are:
-        camera: The camera object to be used for the scene.
-        file_writer : The object that writes the animations in the scene to a video file.
-        mobjects : The list of mobjects present in the scene.
-        foreground_mobjects : List of mobjects explicitly in the foreground.
-        num_plays : Number of play() functions in the scene.
-        time: time elapsed since initialisation of scene.
-        random_seed: The seed with which all random operations are done.
-    """
+class Scene(object):
     CONFIG = {
+        "window_config": {},
         "camera_class": Camera,
         "camera_config": {},
         "file_writer_config": {},
@@ -51,271 +61,260 @@ class Scene(Container):
         "start_at_animation_number": None,
         "end_at_animation_number": None,
         "leave_progress_bars": False,
+        "preview": True,
+        "presenter_mode": False,
+        "show_animation_progress": False,
+        "pan_sensitivity": 3,
+        "max_num_saved_states": 50,
     }
 
     def __init__(self, **kwargs):
-        Container.__init__(self, **kwargs)
-        self.camera = self.camera_class(**self.camera_config)
-        self.file_writer = SceneFileWriter(
-            self, **self.file_writer_config,
-        )
+        digest_config(self, kwargs)
+        if self.preview:
+            from manimlib.window import Window
+            self.window = Window(scene=self, **self.window_config)
+            self.camera_config["ctx"] = self.window.ctx
+            self.camera_config["fps"] = 30  # Where's that 30 from?
+            self.undo_stack = []
+            self.redo_stack = []
+        else:
+            self.window = None
 
-        self.mobjects = []
-        # TODO, remove need for foreground mobjects
-        self.foreground_mobjects = []
-        self.num_plays = 0
-        self.time = 0
-        self.original_skipping_status = self.skip_animations
+        self.camera: Camera = self.camera_class(**self.camera_config)
+        self.file_writer = SceneFileWriter(self, **self.file_writer_config)
+        self.mobjects: list[Mobject] = [self.camera.frame]
+        self.id_to_mobject_map: dict[int, Mobject] = dict()
+        self.num_plays: int = 0
+        self.time: float = 0
+        self.skip_time: float = 0
+        self.original_skipping_status: bool = self.skip_animations
+        self.checkpoint_states: dict[str, list[tuple[Mobject, Mobject]]] = dict()
+
+        if self.start_at_animation_number is not None:
+            self.skip_animations = True
+        if self.file_writer.has_progress_display:
+            self.show_animation_progress = False
+
+        # Items associated with interaction
+        self.mouse_point = Point()
+        self.mouse_drag_point = Point()
+        self.hold_on_wait = self.presenter_mode
+        self.inside_embed = False
+        self.quit_interaction = False
+
+        # Much nicer to work with deterministic scenes
         if self.random_seed is not None:
             random.seed(self.random_seed)
             np.random.seed(self.random_seed)
 
+    def __str__(self) -> str:
+        return self.__class__.__name__
+
+    def run(self) -> None:
+        self.virtual_animation_start_time: float = 0
+        self.real_animation_start_time: float = time.time()
+        self.file_writer.begin()
+
         self.setup()
         try:
             self.construct()
-        except EndSceneEarlyException:
+            self.interact()
+        except EndScene:
             pass
+        except KeyboardInterrupt:
+            # Get rid keyboard interupt symbols
+            print("", end="\r")
+            self.file_writer.ended_with_interrupt = True
         self.tear_down()
-        self.file_writer.finish()
-        self.print_end_message()
 
-    def setup(self):
+    def setup(self) -> None:
         """
-        This is meant to be implemented by any scenes which
+        This is meant to be implement by any scenes which
         are comonly subclassed, and have some common setup
         involved before the construct method is called.
         """
         pass
 
-    def tear_down(self):
-        """
-        This is meant to be implemented by any scenes which
-        are commonly subclassed, and have some common method
-        to be invoked before the scene ends.
-        """
+    def construct(self) -> None:
+        # Where all the animation happens
+        # To be implemented in subclasses
         pass
 
-    def construct(self):
-        """
-        The primary method for constructing (i.e adding content to)
-        the Scene.
-        """
-        pass  # To be implemented in subclasses
+    def tear_down(self) -> None:
+        self.stop_skipping()
+        self.file_writer.finish()
+        if self.window:
+            self.window.destroy()
+            self.window = None
 
-    def __str__(self):
-        return self.__class__.__name__
+    def interact(self) -> None:
+        # If there is a window, enter a loop
+        # which updates the frame while under
+        # the hood calling the pyglet event loop
+        if self.window is None:
+            return
+        log.info(
+            "Tips: You are now in the interactive mode. Now you can use the keyboard"
+            " and the mouse to interact with the scene. Just press `command + q` or `esc`"
+            " if you want to quit."
+        )
+        self.skip_animations = False
+        self.refresh_static_mobjects()
+        while not self.is_window_closing():
+            self.update_frame(1 / self.camera.fps)
 
-    def print_end_message(self):
-        """
-        Used internally to print the number of
-        animations played after the scene ends.
-        """
-        print("Played {} animations".format(self.num_plays))
+    def embed(self, close_scene_on_exit: bool = True) -> None:
+        if not self.preview:
+            return  # Embed is only relevant with a preview
+        self.inside_embed = True
+        self.stop_skipping()
+        self.update_frame()
+        self.save_state()
 
-    def set_variables_as_attrs(self, *objects, **newly_named_objects):
-        """
-        This method is slightly hacky, making it a little easier
-        for certain methods (typically subroutines of construct)
-        to share local variables.
-        """
-        caller_locals = inspect.currentframe().f_back.f_locals
-        for key, value in list(caller_locals.items()):
-            for o in objects:
-                if value is o:
-                    setattr(self, key, value)
-        for key, value in list(newly_named_objects.items()):
-            setattr(self, key, value)
-        return self
+        # Configure and launch embedded IPython terminal
+        from IPython.terminal import embed, pt_inputhooks
+        shell = embed.InteractiveShellEmbed.instance()
 
-    def get_attrs(self, *keys):
-        """
-        Gets attributes of a scene given the attribute's identifier/name.
-        
-        Parameters
-        ----------
-        *args: (str)
-            Name(s) of the argument(s) to return the attribute of.
-        
-        Returns
-        -------
-        list
-            List of attributes of the passed identifiers.
-        """
-        return [getattr(self, key) for key in keys]
+        # Use the locals namespace of the caller
+        local_ns = inspect.currentframe().f_back.f_locals
+        # Add a few custom shortcuts
+        local_ns.update({
+            name: getattr(self, name)
+            for name in [
+                "play", "wait", "add", "remove", "clear",
+                "save_state", "undo", "redo", "i2g", "i2m"
+            ]
+        })
+
+        # This is useful if one wants to re-run a block of scene
+        # code, while developing, tweaking it each time.
+        # As long as the copied selection starts with a comment,
+        # this will revert to the state of the scene at the first
+        # point of running.
+        def checkpoint_paste(skip=False, show_progress=True):
+            pasted = pyperclip.paste()
+            line0 = pasted.lstrip().split("\n")[0]
+            if line0.startswith("#"):
+                if line0 not in self.checkpoint_states:
+                    self.checkpoint(line0)
+                else:
+                    self.revert_to_checkpoint(line0)
+                    self.update_frame(dt=0)
+            if skip:
+                originally_skip = self.skip_animations
+                self.skip_animations = True
+            if show_progress:
+                originally_show_animation_progress = self.show_animation_progress
+                self.show_animation_progress = True
+            shell.run_line_magic("paste", "")
+            if skip:
+                self.skip_animations = originally_skip
+            if show_progress:
+                self.show_animation_progress = originally_show_animation_progress
+
+        local_ns['checkpoint_paste'] = checkpoint_paste
+
+        # Enables gui interactions during the embed
+        def inputhook(context):
+            while not context.input_is_ready():
+                if not self.is_window_closing():
+                    self.update_frame(dt=0)
+            if self.is_window_closing():
+                shell.ask_exit()
+
+        pt_inputhooks.register("manim", inputhook)
+        shell.enable_gui("manim")
+
+        # This is hacky, but there's an issue with ipython which is that
+        # when you define lambda's or list comprehensions during a shell session,
+        # they are not aware of local variables in the surrounding scope. Because
+        # That comes up a fair bit during scene construction, to get around this,
+        # we (admittedly sketchily) update the global namespace to match the local
+        # namespace, since this is just a shell session anyway.
+        shell.events.register(
+            "pre_run_cell",
+            lambda: shell.user_global_ns.update(shell.user_ns)
+        )
+
+        # Operation to run after each ipython command
+        def post_cell_func():
+            self.refresh_static_mobjects()
+            if not self.is_window_closing():
+                self.update_frame(dt=0, ignore_skipping=True)
+            self.save_state()
+
+        shell.events.register("post_run_cell", post_cell_func)
+
+        shell(local_ns=local_ns, stack_depth=2)
+
+        # End scene when exiting an embed
+        if close_scene_on_exit:
+            raise EndScene()
 
     # Only these methods should touch the camera
-    def set_camera(self, camera):
-        """
-        Sets the scene's camera to be the passed Camera Object.
-        Parameters
-        ----------
-        camera: Union[Camera, MappingCamera,MovingCamera,MultiCamera,ThreeDCamera]
-            Camera object to use.
-        """
-        self.camera = camera
 
-    def get_frame(self):
-        """
-        Gets current frame as NumPy array.
-        
-        Returns
-        -------
-        np.array
-            NumPy array of pixel values of each pixel in screen
-        """
-        return np.array(self.camera.get_pixel_array())
-
-    def get_image(self):
-        """
-        Gets current frame as PIL Image
-        
-        Returns
-        -------
-        PIL.Image
-            PIL Image object of current frame.
-        """
+    def get_image(self) -> Image:
         return self.camera.get_image()
 
-    def set_camera_pixel_array(self, pixel_array):
-        """
-        Sets the camera to display a Pixel Array
-        
-        Parameters
-        ----------
-        pixel_array: Union[np.ndarray,list,tuple]
-            Pixel array to set the camera to display
-        """
-        self.camera.set_pixel_array(pixel_array)
+    def show(self) -> None:
+        self.update_frame(ignore_skipping=True)
+        self.get_image().show()
 
-    def set_camera_background(self, background):
-        """
-        Sets the camera to display a Pixel Array
-        
-        Parameters
-        ----------
-        background: Union[np.ndarray,list,tuple]
-            
-        """
-        self.camera.set_background(background)
-
-    def reset_camera(self):
-        """
-        Resets the Camera to its original configuration.
-        """
-        self.camera.reset()
-
-    def capture_mobjects_in_camera(self, mobjects, **kwargs): #TODO Add more detail to docstring.
-        """
-        This method is used internally.
-        """
-        self.camera.capture_mobjects(mobjects, **kwargs)
-
-    def update_frame( #TODO Description in Docstring
-            self,
-            mobjects=None,
-            background=None,
-            include_submobjects=True,
-            ignore_skipping=True,
-            **kwargs):
-        """
-        Parameters:
-        -----------
-        mobjects: list
-            list of mobjects
-        
-        background: np.ndarray
-            Pixel Array for Background
-        
-        include_submobjects: bool (True)
-        
-        ignore_skipping : bool (True)
-
-        **kwargs
-
-        """
+    def update_frame(self, dt: float = 0, ignore_skipping: bool = False) -> None:
+        self.increment_time(dt)
+        self.update_mobjects(dt)
         if self.skip_animations and not ignore_skipping:
             return
-        if mobjects is None:
-            mobjects = list_update(
-                self.mobjects,
-                self.foreground_mobjects,
-            )
-        if background is not None:
-            self.set_camera_pixel_array(background)
-        else:
-            self.reset_camera()
 
-        kwargs["include_submobjects"] = include_submobjects
-        self.capture_mobjects_in_camera(mobjects, **kwargs)
+        if self.is_window_closing():
+            raise EndScene()
 
-    def freeze_background(self):
-        self.update_frame()
-        self.set_camera(Camera(self.get_frame()))
-        self.clear()
-    ###
+        if self.window:
+            self.window.clear()
+        self.camera.clear()
+        self.camera.capture(*self.mobjects)
 
-    def update_mobjects(self, dt):
-        """
-        Begins updating all mobjects in the Scene.
-        
-        Parameters
-        ----------
-        dt: Union[int,float]
-            Change in time between updates. Defaults (mostly) to 1/frames_per_second
-        """
+        if self.window:
+            self.window.swap_buffers()
+            vt = self.time - self.virtual_animation_start_time
+            rt = time.time() - self.real_animation_start_time
+            if rt < vt:
+                self.update_frame(0)
+
+    def emit_frame(self) -> None:
+        if not self.skip_animations:
+            self.file_writer.write_frame(self.camera)
+
+    # Related to updating
+
+    def update_mobjects(self, dt: float) -> None:
         for mobject in self.mobjects:
             mobject.update(dt)
 
-    def should_update_mobjects(self):
-        """
-        Returns True if any mobject in Scene is being updated
-        or if the scene has always_update_mobjects set to true.
-        
-        Returns
-        -------
-            bool
-        """
+    def should_update_mobjects(self) -> bool:
         return self.always_update_mobjects or any([
-            mob.has_time_based_updater()
-            for mob in self.get_mobject_family_members()
+            len(mob.get_family_updaters()) > 0
+            for mob in self.mobjects
         ])
 
-    ###
+    def has_time_based_updaters(self) -> bool:
+        return any([
+            sm.has_time_based_updater()
+            for mob in self.mobjects()
+            for sm in mob.get_family()
+        ])
 
-    def get_time(self):
-        """
-        Returns time in seconds elapsed after initialisation of scene
-        
-        Returns
-        -------
-        self.time : Union[int,float]
-            Returns time in seconds elapsed after initialisation of scene
-        """
+    # Related to time
+
+    def get_time(self) -> float:
         return self.time
 
-    def increment_time(self, d_time):
-        """
-        Increments the time elapsed after intialisation of scene by
-        passed "d_time".
-        
-        Parameters
-        ----------
-        d_time : Union[int,float]
-            Time in seconds to increment by.
-        """
-        self.time += d_time
+    def increment_time(self, dt: float) -> None:
+        self.time += dt
 
-    ###
+    # Related to internal mobject organization
 
-    def get_top_level_mobjects(self):
-        """
-        Returns all mobjects which are not submobjects.
-
-        Returns
-        -------
-        list
-            List of top level mobjects.
-        """
+    def get_top_level_mobjects(self) -> list[Mobject]:
         # Return only those which are not in the family
         # of another mobject from the scene
         mobjects = self.get_mobjects()
@@ -329,42 +328,24 @@ class Scene(Container):
             return num_families == 1
         return list(filter(is_top_level, mobjects))
 
-    def get_mobject_family_members(self):
-        """
-        Returns list of family-members of all mobjects in scene.
-        If a Circle() and a VGroup(Rectangle(),Triangle()) were added,
-        it returns not only the Circle(), Rectangle() and Triangle(), but
-        also the VGroup() object.
+    def get_mobject_family_members(self) -> list[Mobject]:
+        return extract_mobject_family_members(self.mobjects)
 
-        Returns
-        -------
-        list
-            List of mobject family members.
-        """
-        return self.camera.extract_mobject_family_members(self.mobjects)
-
-    def add(self, *mobjects):
+    def add(self, *new_mobjects: Mobject):
         """
         Mobjects will be displayed, from background to
         foreground in the order with which they are added.
-
-        Parameters
-        ---------
-        *mobjects
-            Mobjects to add.
-        
-        Returns
-        -------
-        Scene
-            The same scene after adding the Mobjects in.
-
         """
-        mobjects = [*mobjects, *self.foreground_mobjects]
-        self.restructure_mobjects(to_remove=mobjects)
-        self.mobjects += mobjects
+        self.remove(*new_mobjects)
+        self.mobjects += new_mobjects
+        self.id_to_mobject_map.update({
+            id(sm): sm
+            for m in new_mobjects
+            for sm in m.get_family()
+        })
         return self
 
-    def add_mobjects_among(self, values):
+    def add_mobjects_among(self, values: Iterable):
         """
         This is meant mostly for quick prototyping,
         e.g. to add all mobjects defined up to a point,
@@ -376,518 +357,219 @@ class Scene(Container):
         ))
         return self
 
-    def remove(self, *mobjects):
-        """
-        Removes mobjects in the passed list of mobjects
-        from the scene and the foreground, by removing them
-        from "mobjects" and "foreground_mobjects"
-        """
-        for list_name in "mobjects", "foreground_mobjects":
-            self.restructure_mobjects(mobjects, list_name, False)
+    def replace(self, mobject: Mobject, *replacements: Mobject):
+        if mobject in self.mobjects:
+            index = self.mobjects.index(mobject)
+            self.mobjects = [
+                *self.mobjects[:index],
+                *replacements,
+                *self.mobjects[index + 1:]
+            ]
         return self
 
-    def restructure_mobjects(self, to_remove,
-                             mobject_list_name="mobjects",
-                             extract_families=True):
+    def remove(self, *mobjects: Mobject):
         """
-        tl:wr
-            If your scene has a Group(), and you removed a mobject from the Group,
-            this dissolves the group and puts the rest of the mobjects directly 
-            in self.mobjects or self.foreground_mobjects.
-        
-        In cases where the scene contains a group, e.g. Group(m1, m2, m3), but one
-        of its submobjects is removed, e.g. scene.remove(m1), the list of mobjects
-        will be edited to contain other submobjects, but not m1, e.g. it will now
-        insert m2 and m3 to where the group once was.
+        Removes anything in mobjects from scenes mobject list, but in the event that one
+        of the items to be removed is a member of the family of an item in mobject_list,
+        the other family members are added back into the list.
 
-        Parameters
-        ----------
-        to_remove : Mobject
-            The Mobject to remove.
-        
-        mobject_list_name : str
-            The list of mobjects ("mobjects", "foreground_mobjects" etc) to remove from.
-        
-        extract_families : bool
-            Whether the mobject's families should be recursively extracted.
-        
-        Returns
-        -------
-        Scene
-            The Scene mobject with restructured Mobjects.
+        For example, if the scene includes Group(m1, m2, m3), and we call scene.remove(m1),
+        the desired behavior is for the scene to then include m2 and m3 (ungrouped).
         """
-        if extract_families:
-            to_remove = self.camera.extract_mobject_family_members(to_remove)
-        _list = getattr(self, mobject_list_name)
-        new_list = self.get_restructured_mobject_list(_list, to_remove)
-        setattr(self, mobject_list_name, new_list)
+        for mob in mobjects:
+            # First restructure self.mobjects so that parents/grandparents/etc. are replaced
+            # with their children, likewise for all ancestors in the extended family.
+            for ancestor in mob.get_ancestors(extended=True):
+                self.replace(ancestor, *ancestor.submobjects)
+            self.mobjects = list_difference_update(self.mobjects, mob.get_family())
         return self
 
-    def get_restructured_mobject_list(self, mobjects, to_remove):
-        """
-        Given a list of mobjects and a list of mobjects to be removed, this
-        filters out the removable mobjects from the list of mobjects.
-        
-        Parameters
-        ----------
-
-        mobjects : list
-            The Mobjects to check.
-        
-        to_remove : list
-            The list of mobjects to remove.
-        
-        Returns
-        -------
-        list
-            The list of mobjects with the mobjects to remove removed.
-        """
-        
-        new_mobjects = []
-
-        def add_safe_mobjects_from_list(list_to_examine, set_to_remove):
-            for mob in list_to_examine:
-                if mob in set_to_remove:
-                    continue
-                intersect = set_to_remove.intersection(mob.get_family())
-                if intersect:
-                    add_safe_mobjects_from_list(mob.submobjects, intersect)
-                else:
-                    new_mobjects.append(mob)
-        add_safe_mobjects_from_list(mobjects, set(to_remove))
-        return new_mobjects
-
-    # TODO, remove this, and calls to this
-    def add_foreground_mobjects(self, *mobjects):
-        """
-        Adds mobjects to the foreground, and internally to the list 
-        foreground_mobjects, and mobjects.
-
-        Parameters
-        ----------
-        *mobjects : Mobject
-            The Mobjects to add to the foreground.
-        
-        Returns
-        ------
-        Scene
-            The Scene, with the foreground mobjects added.
-        """
-        self.foreground_mobjects = list_update(
-            self.foreground_mobjects,
-            mobjects
-        )
+    def bring_to_front(self, *mobjects: Mobject):
         self.add(*mobjects)
         return self
 
-    def add_foreground_mobject(self, mobject):
-        """
-        Adds a single mobject to the foreground, and internally to the list 
-        foreground_mobjects, and mobjects.
-
-        Parameters
-        ----------
-        mobject : Mobject
-            The Mobject to add to the foreground.
-        
-        Returns
-        ------
-        Scene
-            The Scene, with the foreground mobject added.
-        """
-        return self.add_foreground_mobjects(mobject)
-
-    def remove_foreground_mobjects(self, *to_remove):
-        """
-        Removes mobjects from the foreground, and internally from the list 
-        foreground_mobjects.
-
-        Parameters
-        ----------
-        *to_remove : Mobject
-            The mobject(s) to remove from the foreground.
-        
-        Returns
-        ------
-        Scene
-            The Scene, with the foreground mobjects removed.
-        """
-        self.restructure_mobjects(to_remove, "foreground_mobjects")
-        return self
-
-    def remove_foreground_mobject(self, mobject):
-        """
-        Removes a single mobject from the foreground, and internally from the list 
-        foreground_mobjects.
-
-        Parameters
-        ----------
-        mobject : Mobject
-            The mobject to remove from the foreground.
-        
-        Returns
-        ------
-        Scene
-            The Scene, with the foreground mobject removed.
-        """
-        return self.remove_foreground_mobjects(mobject)
-
-    def bring_to_front(self, *mobjects):
-        """
-        Adds the passed mobjects to the scene again, 
-        pushing them to he front of the scene.
-
-        Parameters
-        ----------
-        *mobjects : Mobject
-            The mobject(s) to bring to the front of the scene.
-        
-        Returns
-        ------
-        Scene
-            The Scene, with the mobjects brought to the front
-            of the scene.
-        """
-        self.add(*mobjects)
-        return self
-
-    def bring_to_back(self, *mobjects):
-        """
-        Removes the mobject from the scene and
-        adds them to the back of the scene.
-
-        Parameters
-        ----------
-        *mobjects : Mobject
-            The mobject(s) to push to the back of the scene.
-        
-        Returns
-        ------
-        Scene
-            The Scene, with the mobjects pushed to the back
-            of the scene.
-        """
+    def bring_to_back(self, *mobjects: Mobject):
         self.remove(*mobjects)
         self.mobjects = list(mobjects) + self.mobjects
         return self
 
     def clear(self):
-        """
-        Removes all mobjects present in self.mobjects
-        and self.foreground_mobjects from the scene.
-
-        Returns
-        ------
-        Scene
-            The Scene, with all of its mobjects in 
-            self.mobjects and self.foreground_mobjects
-            removed.
-        """
         self.mobjects = []
-        self.foreground_mobjects = []
         return self
 
-    def get_mobjects(self):
-        """
-        Returns all the mobjects in self.mobjects
-
-        Returns
-        ------
-        list
-            The list of self.mobjects .
-        """
+    def get_mobjects(self) -> list[Mobject]:
         return list(self.mobjects)
 
-    def get_mobject_copies(self):
-        """
-        Returns a copy of all mobjects present in
-        self.mobjects .
-
-        Returns
-        ------
-        list
-            A list of the copies of all the mobjects
-            in self.mobjects
-        """
+    def get_mobject_copies(self) -> list[Mobject]:
         return [m.copy() for m in self.mobjects]
 
-    def get_moving_mobjects(self, *animations):
+    def point_to_mobject(
+        self,
+        point: np.ndarray,
+        search_set: Iterable[Mobject] | None = None,
+        buff: float = 0
+    ) -> Mobject | None:
         """
-        Gets all moving mobjects in the passed animation(s).
-        
-        Parameters
-        ----------
-        *animations
-            The animations to check for moving mobjects.
-
-        Returns
-        ------
-        list
-            The list of mobjects that could be moving in
-            the Animation(s)
+        E.g. if clicking on the scene, this returns the top layer mobject
+        under a given point
         """
-        # Go through mobjects from start to end, and
-        # as soon as there's one that needs updating of
-        # some kind per frame, return the list from that
-        # point forward.
-        animation_mobjects = [anim.mobject for anim in animations]
-        mobjects = self.get_mobject_family_members()
-        for i, mob in enumerate(mobjects):
-            update_possibilities = [
-                mob in animation_mobjects,
-                len(mob.get_family_updaters()) > 0,
-                mob in self.foreground_mobjects
-            ]
-            if any(update_possibilities):
-                return mobjects[i:]
-        return []
+        if search_set is None:
+            search_set = self.mobjects
+        for mobject in reversed(search_set):
+            if mobject.is_point_touching(point, buff=buff):
+                return mobject
+        return None
 
-    def get_time_progression(self, run_time, n_iterations=None, override_skip_animations=False):
-        """
-        You will hardly use this when making your own animations.
-        This method is for Manim's internal use.
-
-        Returns a CommandLine ProgressBar whose fill_time
-        is dependent on the run_time of an animation, 
-        the iterations to perform in that animation
-        and a bool saying whether or not to consider
-        the skipped animations.
-
-        Parameters
-        ----------
-        run_time: Union[int,float]
-            The run_time of the animation.
-        
-        n_iterations: None, int
-            The number of iterations in the animation.
-        
-        override_skip_animations: bool (True)
-            Whether or not to show skipped animations in the progress bar.
-
-        Returns
-        ------
-        ProgressDisplay
-            The CommandLine Progress Bar.
-        """
-        if self.skip_animations and not override_skip_animations:
-            times = [run_time]
+    def get_group(self, *mobjects):
+        if all(isinstance(m, VMobject) for m in mobjects):
+            return VGroup(*mobjects)
         else:
-            step = 1 / self.camera.frame_rate
-            times = np.arange(0, run_time, step)
-        time_progression = ProgressDisplay(
-            times, total=n_iterations,
-            leave=self.leave_progress_bars,
-            ascii=False if platform.system() != 'Windows' else True
-        )
-        return time_progression
+            return Group(*mobjects)
 
-    def get_run_time(self, animations):
-        """
-        Gets the total run time for a list of animations.
+    def id_to_mobject(self, id_value):
+        return self.id_to_mobject_map[id_value]
 
-        Parameters
-        ----------
-        animations: list
-            A list of the animations whose total 
-            run_time is to be calculated.
-        
-        Returns
-        ------
-        float
-            The total run_time of all of the animations in the list.
-        """
+    def ids_to_group(self, *id_values):
+        return self.get_group(*filter(
+            lambda x: x is not None,
+            map(self.id_to_mobject, id_values)
+        ))
 
-        return np.max([animation.run_time for animation in animations])
+    def i2g(self, *id_values):
+        return self.ids_to_group(*id_values)
 
-    def get_animation_time_progression(self, animations):
-        """
-        You will hardly use this when making your own animations.
-        This method is for Manim's internal use.
+    def i2m(self, id_value):
+        return self.id_to_mobject(id_value)
 
-        Uses get_time_progression to obtaina
-        CommandLine ProgressBar whose fill_time is
-        dependent on the qualities of the passed animation, 
+    # Related to skipping
 
-        Parameters
-        ----------
-        animations : list
-            The list of animations to get
-            the time progression for.
+    def update_skipping_status(self) -> None:
+        if self.start_at_animation_number is not None:
+            if self.num_plays == self.start_at_animation_number:
+                self.skip_time = self.time
+                if not self.original_skipping_status:
+                    self.stop_skipping()
+        if self.end_at_animation_number is not None:
+            if self.num_plays >= self.end_at_animation_number:
+                raise EndScene()
 
-        Returns
-        ------
-        ProgressDisplay
-            The CommandLine Progress Bar.
-        """
-        run_time = self.get_run_time(animations)
-        time_progression = self.get_time_progression(run_time)
-        time_progression.set_description("".join([
-            "Animation {}: ".format(self.num_plays),
-            str(animations[0]),
-            (", etc." if len(animations) > 1 else ""),
-        ]))
-        return time_progression
+    def stop_skipping(self) -> None:
+        self.virtual_animation_start_time = self.time
+        self.skip_animations = False
 
-    def compile_play_args_to_animation_list(self, *args, **kwargs):
-        """
-        Each arg can either be an animation, or a mobject method
-        followed by that methods arguments (and potentially follow
-        by a dict of kwargs for that method).
-        This animation list is built by going through the args list,
-        and each animation is simply added, but when a mobject method
-        s hit, a MoveToTarget animation is built using the args that
-        follow up until either another animation is hit, another method
-        is hit, or the args list runs out.
-        
-        Parameters
-        ----------
-        *args : Union[Animation, method(of a mobject, which is followed by that method's arguments)]
-        **kwargs : any named arguments like run_time or lag_ratio.
+    # Methods associated with running animations
 
-        Returns
-        -------
-        list : list of animations with the parameters applied to them.
-        """
-        animations = []
-        state = {
-            "curr_method": None,
-            "last_method": None,
-            "method_args": [],
-        }
+    def get_time_progression(
+        self,
+        run_time: float,
+        n_iterations: int | None = None,
+        desc: str = "",
+        override_skip_animations: bool = False
+    ) -> list[float] | np.ndarray | ProgressDisplay:
+        if self.skip_animations and not override_skip_animations:
+            return [run_time]
 
-        def compile_method(state):
-            if state["curr_method"] is None:
-                return
-            mobject = state["curr_method"].__self__
-            if state["last_method"] and state["last_method"].__self__ is mobject:
-                animations.pop()
-                # method should already have target then.
-            else:
-                mobject.generate_target()
-            #
-            if len(state["method_args"]) > 0 and isinstance(state["method_args"][-1], dict):
-                method_kwargs = state["method_args"].pop()
-            else:
-                method_kwargs = {}
-            state["curr_method"].__func__(
-                mobject.target,
-                *state["method_args"],
-                **method_kwargs
+        times = np.arange(0, run_time, 1 / self.camera.fps)
+
+        if self.file_writer.has_progress_display:
+            self.file_writer.set_progress_display_subdescription(desc)
+
+        if self.show_animation_progress:
+            return ProgressDisplay(
+                times,
+                total=n_iterations,
+                leave=self.leave_progress_bars,
+                ascii=True if platform.system() == 'Windows' else None,
+                desc=desc,
             )
-            animations.append(MoveToTarget(mobject))
-            state["last_method"] = state["curr_method"]
-            state["curr_method"] = None
-            state["method_args"] = []
+        else:
+            return times
 
-        for arg in args:
-            if isinstance(arg, Animation):
-                compile_method(state)
-                animations.append(arg)
-            elif inspect.ismethod(arg):
-                compile_method(state)
-                state["curr_method"] = arg
-            elif state["curr_method"] is not None:
-                state["method_args"].append(arg)
-            elif isinstance(arg, Mobject):
-                raise Exception("""
-                    I think you may have invoked a method
-                    you meant to pass in as a Scene.play argument
-                """)
-            else:
-                raise Exception("Invalid play arguments")
-        compile_method(state)
+    def get_run_time(self, animations: Iterable[Animation]) -> float:
+        return np.max([animation.get_run_time() for animation in animations])
 
-        for animation in animations:
+    def get_animation_time_progression(
+        self,
+        animations: Iterable[Animation]
+    ) -> list[float] | np.ndarray | ProgressDisplay:
+        run_time = self.get_run_time(animations)
+        description = f"{self.num_plays} {animations[0]}"
+        if len(animations) > 1:
+            description += ", etc."
+        time_progression = self.get_time_progression(run_time, desc=description)
+        return time_progression
+
+    def get_wait_time_progression(
+        self,
+        duration: float,
+        stop_condition: Callable[[], bool] | None = None
+    ) -> list[float] | np.ndarray | ProgressDisplay:
+        kw = {"desc": f"{self.num_plays} Waiting"}
+        if stop_condition is not None:
+            kw["n_iterations"] = -1  # So it doesn't show % progress
+            kw["override_skip_animations"] = True
+        return self.get_time_progression(duration, **kw)
+
+    def prepare_animations(
+        self,
+        proto_animations: list[Animation | _AnimationBuilder],
+        animation_config: dict,
+    ):
+        animations = list(map(prepare_animation, proto_animations))
+        for anim in animations:
             # This is where kwargs to play like run_time and rate_func
             # get applied to all animations
-            animation.update_config(**kwargs)
-
+            anim.update_config(**animation_config)
         return animations
 
-    def update_skipping_status(self):
-        """
-        This method is used internally to check if the current
-        animation needs to be skipped or not. It also checks if
-        the number of animations that were played correspond to
-        the number of animations that need to be played, and 
-        raises an EndSceneEarlyException if they don't correspond.
-        """
-        
-        if self.start_at_animation_number:
-            if self.num_plays == self.start_at_animation_number:
-                self.skip_animations = False
-        if self.end_at_animation_number:
-            if self.num_plays >= self.end_at_animation_number:
-                self.skip_animations = True
-                raise EndSceneEarlyException()
-
     def handle_play_like_call(func):
-        """
-        This method is used internally to wrap the
-        passed function, into a function that
-        actually writes to the video stream.
-        Simultaneously, it also adds to the number 
-        of animations played.
-
-        Parameters
-        ----------
-        func: function object
-            The play() like function that has to be
-            written to the video file stream.
-
-        Returns
-        -------
-        function object
-            The play() like function that can now write
-            to the video file stream.
-        """
+        @wraps(func)
         def wrapper(self, *args, **kwargs):
+            if self.inside_embed:
+                self.save_state()
+            if self.presenter_mode and self.num_plays == 0:
+                self.hold_loop()
+
             self.update_skipping_status()
-            allow_write = not self.skip_animations
-            self.file_writer.begin_animation(allow_write)
+            should_write = not self.skip_animations
+            if should_write:
+                self.file_writer.begin_animation()
+
+            if self.window:
+                self.real_animation_start_time = time.time()
+                self.virtual_animation_start_time = self.time
+
+            self.refresh_static_mobjects()
             func(self, *args, **kwargs)
-            self.file_writer.end_animation(allow_write)
+
+            if should_write:
+                self.file_writer.end_animation()
+
+            if self.inside_embed:
+                self.save_state()
+
+            if self.skip_animations and self.window is not None:
+                # Show some quick frames along the way
+                self.update_frame(dt=0, ignore_skipping=True)
+
             self.num_plays += 1
         return wrapper
 
-    def begin_animations(self, animations):
-        """
-        This method begins the list of animations that is passed,
-        and adds any mobjects involved (if not already present)
-        to the scene again.
+    def refresh_static_mobjects(self) -> None:
+        self.camera.refresh_static_mobjects()
 
-        Parameters
-        ----------
-        animations: list
-            List of involved animations.
-
-        """
-        curr_mobjects = self.get_mobject_family_members()
+    def begin_animations(self, animations: Iterable[Animation]) -> None:
         for animation in animations:
-            # Begin animation
             animation.begin()
             # Anything animated that's not already in the
-            # scene gets added to the scene
-            mob = animation.mobject
-            if mob not in curr_mobjects:
-                self.add(mob)
-                curr_mobjects += mob.get_family()
+            # scene gets added to the scene.  Note, for
+            # animated mobjects that are in the family of
+            # those on screen, this can result in a restructuring
+            # of the scene.mobjects list, which is usually desired.
+            if animation.mobject not in self.mobjects:
+                self.add(animation.mobject)
 
-    def progress_through_animations(self, animations):
-        """
-        This method progresses through each animation
-        in the list passed and and updates the frames as required.
-
-        Parameters
-        ----------
-        animations: list
-            List of involved animations.
-        """
-        # Paint all non-moving objects onto the screen, so they don't
-        # have to be rendered every frame
-        moving_mobjects = self.get_moving_mobjects(*animations)
-        self.update_frame(excluded_mobjects=moving_mobjects)
-        static_image = self.get_frame()
+    def progress_through_animations(self, animations: Iterable[Animation]) -> None:
         last_t = 0
         for t in self.get_animation_time_progression(animations):
             dt = t - last_t
@@ -896,274 +578,333 @@ class Scene(Container):
                 animation.update_mobjects(dt)
                 alpha = t / animation.run_time
                 animation.interpolate(alpha)
-            self.update_mobjects(dt)
-            self.update_frame(moving_mobjects, static_image)
-            self.add_frames(self.get_frame())
+            self.update_frame(dt)
+            self.emit_frame()
 
-    def finish_animations(self, animations):
-        """
-        This function cleans up after the end
-        of each animation in the passed list.
-
-        Parameters
-        ----------
-        animations: list
-            list of animations to finish.
-        """
+    def finish_animations(self, animations: Iterable[Animation]) -> None:
         for animation in animations:
             animation.finish()
             animation.clean_up_from_scene(self)
-        self.mobjects_from_last_animation = [
-            anim.mobject for anim in animations
-        ]
         if self.skip_animations:
-            # TODO, run this call in for each animation?
             self.update_mobjects(self.get_run_time(animations))
         else:
             self.update_mobjects(0)
 
     @handle_play_like_call
-    def play(self, *args, **kwargs):
-        """
-        This method is used to prep the animations for rendering,
-        apply the arguments and parameters required to them,
-        render them, and write them to the video file.
-
-        Parameters
-        ----------
-        *args: Animation, mobject with mobject method and params
-        **kwargs: named parameters affecting what was passed in *args e.g run_time, lag_ratio etc.
-        """
-        if len(args) == 0:
-            warnings.warn("Called Scene.play with no animations")
+    def play(self, *proto_animations, **animation_config) -> None:
+        if len(proto_animations) == 0:
+            log.warning("Called Scene.play with no animations")
             return
-        animations = self.compile_play_args_to_animation_list(
-            *args, **kwargs
-        )
+        animations = self.prepare_animations(proto_animations, animation_config)
         self.begin_animations(animations)
         self.progress_through_animations(animations)
         self.finish_animations(animations)
 
-    def idle_stream(self):
-        """
-        This method is used internally to 
-        idle the vide file_writer until an
-        animation etc needs to be written 
-        to the video file.
-        """
-        self.file_writer.idle_stream()
-
-    def clean_up_animations(self, *animations):
-        """
-        This method cleans up and removes from the
-        scene all the animations that were passed
-
-        Parameters
-        ----------
-        *animations: Animation
-            Animation to clean up.
-
-        Returns
-        -------
-        Scene
-            The scene with the animations
-            cleaned up.
-
-        """
-        for animation in animations:
-            animation.clean_up_from_scene(self)
-        return self
-
-    def get_mobjects_from_last_animation(self):
-        """
-        This method returns the mobjects from the previous
-        played animation, if any exist, and returns an empty
-        list if not.
-
-        Returns
-        --------
-        list
-            The list of mobjects from the previous animation.
-
-        """
-        if hasattr(self, "mobjects_from_last_animation"):
-            return self.mobjects_from_last_animation
-        return []
-
-    def get_wait_time_progression(self, duration, stop_condition):
-        """
-        This method is used internally to obtain the CommandLine
-        Progressbar for when self.wait() is called in a scene.
-
-        Parameters
-        ----------
-        duration: Union[list,float]
-            duration of wait time
-        
-        stop_condition: function
-            The function which determines whether to continue waiting.
-        
-        Returns
-        -------
-        ProgressBar
-            The CommandLine ProgressBar of the wait time
-
-        """
-        if stop_condition is not None:
-            time_progression = self.get_time_progression(
-                duration,
-                n_iterations=-1,  # So it doesn't show % progress
-                override_skip_animations=True
-            )
-            time_progression.set_description(
-                "Waiting for {}".format(stop_condition.__name__)
-            )
-        else:
-            time_progression = self.get_time_progression(duration)
-            time_progression.set_description(
-                "Waiting {}".format(self.num_plays)
-            )
-        return time_progression
-
     @handle_play_like_call
-    def wait(self, duration=DEFAULT_WAIT_TIME, stop_condition=None):
-        """
-        This method is used to wait, and do nothing to the scene, for some
-        duration.
-        Updaters stop updating, nothing happens.
-
-        Parameters
-        ----------
-        duration : Union[float, int]
-            The duration of wait time. Defaults to None.
-        stop_condition : 
-            A function that determines whether to stop waiting or not.
-        
-        Returns
-        -------
-        Scene
-            The scene, after waiting.
-        """
+    def wait(
+        self,
+        duration: float = DEFAULT_WAIT_TIME,
+        stop_condition: Callable[[], bool] = None,
+        note: str = None,
+        ignore_presenter_mode: bool = False
+    ):
         self.update_mobjects(dt=0)  # Any problems with this?
-        if self.should_update_mobjects():
+        if self.presenter_mode and not self.skip_animations and not ignore_presenter_mode:
+            if note:
+                log.info(note)
+            self.hold_loop()
+        else:
             time_progression = self.get_wait_time_progression(duration, stop_condition)
-            # TODO, be smart about setting a static image
-            # the same way Scene.play does
             last_t = 0
             for t in time_progression:
                 dt = t - last_t
                 last_t = t
-                self.update_mobjects(dt)
-                self.update_frame()
-                self.add_frames(self.get_frame())
+                self.update_frame(dt)
+                self.emit_frame()
                 if stop_condition is not None and stop_condition():
-                    time_progression.close()
                     break
-        elif self.skip_animations:
-            # Do nothing
-            return self
-        else:
-            self.update_frame()
-            dt = 1 / self.camera.frame_rate
-            n_frames = int(duration / dt)
-            frame = self.get_frame()
-            self.add_frames(*[frame] * n_frames)
+        self.refresh_static_mobjects()
         return self
 
-    def wait_until(self, stop_condition, max_time=60):
-        """
-        Like a wrapper for wait().
-        You pass a function that determines whether to continue waiting,
-        and a max wait time if that is never fulfilled.
-        
-        Parameters
-        ----------
-        stop_condition: function definition
-            The function whose boolean return value determines whether to continue waiting
-        
-        max_time: Union[int,float]
-            The maximum wait time in seconds, if the stop_condition is never fulfilled.
-            Defaults to 60.
-        """
+    def hold_loop(self):
+        while self.hold_on_wait:
+            self.update_frame(dt=1 / self.camera.fps)
+        self.hold_on_wait = True
+
+    def wait_until(
+        self,
+        stop_condition: Callable[[], bool],
+        max_time: float = 60
+    ):
         self.wait(max_time, stop_condition=stop_condition)
 
     def force_skipping(self):
-        """
-        This forces the skipping of animations,
-        by setting original_skipping_status to
-        whatever skip_animations was, and setting
-        skip_animations to True.
-
-        Returns
-        -------
-        Scene
-            The Scene, with skipping turned on.
-        """
         self.original_skipping_status = self.skip_animations
         self.skip_animations = True
         return self
 
     def revert_to_original_skipping_status(self):
-        """
-        Forces the scene to go back to its original skipping status,
-        by setting skip_animations to whatever it reads 
-        from original_skipping_status.
-
-        Returns
-        -------
-        Scene
-            The Scene, with the original skipping status.
-        """
         if hasattr(self, "original_skipping_status"):
             self.skip_animations = self.original_skipping_status
         return self
 
-    def add_frames(self, *frames):
-        """
-        Adds a frame to the video_file_stream
-
-        Parameters
-        ----------
-        *frames : numpy.ndarray
-            The frames to add, as pixel arrays.
-        """
-        dt = 1 / self.camera.frame_rate
-        self.increment_time(len(frames) * dt)
-        if self.skip_animations:
-            return
-        for frame in frames:
-            self.file_writer.write_frame(frame)
-
-    def add_sound(self, sound_file, time_offset=0, gain=None, **kwargs):
-        """
-        This method is used to add a sound to the animation.
-
-        Parameters
-        ----------
-        sound_file: str
-            The path to the sound file.
-        
-        time_offset: int,float = 0
-            The offset in the sound file after which
-            the sound can be played.
-        gain:
-            
-        **kwargs : Present for excess? 
-
-        """
+    def add_sound(
+        self,
+        sound_file: str,
+        time_offset: float = 0,
+        gain: float | None = None,
+        gain_to_background: float | None = None
+    ):
         if self.skip_animations:
             return
         time = self.get_time() + time_offset
-        self.file_writer.add_sound(sound_file, time, gain, **kwargs)
+        self.file_writer.add_sound(sound_file, time, gain, gain_to_background)
 
-    def show_frame(self):
-        """
-        Opens the current frame in the Default Image Viewer
-        of your system.
-        """
-        self.update_frame(ignore_skipping=True)
-        self.get_image().show()
+    # Helpers for interactive development
+
+    def get_state(self) -> SceneState:
+        return SceneState(self)
+
+    def restore_state(self, scene_state: SceneState):
+        scene_state.restore_scene(self)
+
+    def save_state(self) -> None:
+        if not self.preview:
+            return
+        state = self.get_state()
+        if self.undo_stack and state.mobjects_match(self.undo_stack[-1]):
+            return
+        self.redo_stack = []
+        self.undo_stack.append(state)
+        if len(self.undo_stack) > self.max_num_saved_states:
+            self.undo_stack.pop(0)
+
+    def undo(self):
+        if self.undo_stack:
+            self.redo_stack.append(self.get_state())
+            self.restore_state(self.undo_stack.pop())
+        self.refresh_static_mobjects()
+
+    def redo(self):
+        if self.redo_stack:
+            self.undo_stack.append(self.get_state())
+            self.restore_state(self.redo_stack.pop())
+        self.refresh_static_mobjects()
+
+    def checkpoint(self, key: str):
+        self.checkpoint_states[key] = self.get_state()
+
+    def revert_to_checkpoint(self, key: str):
+        if key not in self.checkpoint_states:
+            log.error(f"No checkpoint at {key}")
+            return
+        all_keys = list(self.checkpoint_states.keys())
+        index = all_keys.index(key)
+        for later_key in all_keys[index + 1:]:
+            self.checkpoint_states.pop(later_key)
+
+        self.restore_state(self.checkpoint_states[key])
+
+    def clear_checkpoints(self):
+        self.checkpoint_states = dict()
+
+    def save_mobject_to_file(self, mobject: Mobject, file_path: str | None = None) -> None:
+        if file_path is None:
+            file_path = self.file_writer.get_saved_mobject_path(mobject)
+            if file_path is None:
+                return
+        mobject.save_to_file(file_path)
+
+    def load_mobject(self, file_name):
+        if os.path.exists(file_name):
+            path = file_name
+        else:
+            directory = self.file_writer.get_saved_mobject_directory()
+            path = os.path.join(directory, file_name)
+        return Mobject.load(path)
+
+    def is_window_closing(self):
+        return self.window and (self.window.is_closing or self.quit_interaction)
+
+    # Event handling
+
+    def on_mouse_motion(
+        self,
+        point: np.ndarray,
+        d_point: np.ndarray
+    ) -> None:
+        self.mouse_point.move_to(point)
+
+        event_data = {"point": point, "d_point": d_point}
+        propagate_event = EVENT_DISPATCHER.dispatch(EventType.MouseMotionEvent, **event_data)
+        if propagate_event is not None and propagate_event is False:
+            return
+
+        frame = self.camera.frame
+        # Handle perspective changes
+        if self.window.is_key_pressed(ord(PAN_3D_KEY)):
+            frame.increment_theta(-self.pan_sensitivity * d_point[0])
+            frame.increment_phi(self.pan_sensitivity * d_point[1])
+        # Handle frame movements
+        elif self.window.is_key_pressed(ord(FRAME_SHIFT_KEY)):
+            shift = -d_point
+            shift[0] *= frame.get_width() / 2
+            shift[1] *= frame.get_height() / 2
+            transform = frame.get_inverse_camera_rotation_matrix()
+            shift = np.dot(np.transpose(transform), shift)
+            frame.shift(shift)
+
+    def on_mouse_drag(
+        self,
+        point: np.ndarray,
+        d_point: np.ndarray,
+        buttons: int,
+        modifiers: int
+    ) -> None:
+        self.mouse_drag_point.move_to(point)
+
+        event_data = {"point": point, "d_point": d_point, "buttons": buttons, "modifiers": modifiers}
+        propagate_event = EVENT_DISPATCHER.dispatch(EventType.MouseDragEvent, **event_data)
+        if propagate_event is not None and propagate_event is False:
+            return
+
+    def on_mouse_press(
+        self,
+        point: np.ndarray,
+        button: int,
+        mods: int
+    ) -> None:
+        self.mouse_drag_point.move_to(point)
+        event_data = {"point": point, "button": button, "mods": mods}
+        propagate_event = EVENT_DISPATCHER.dispatch(EventType.MousePressEvent, **event_data)
+        if propagate_event is not None and propagate_event is False:
+            return
+
+    def on_mouse_release(
+        self,
+        point: np.ndarray,
+        button: int,
+        mods: int
+    ) -> None:
+        event_data = {"point": point, "button": button, "mods": mods}
+        propagate_event = EVENT_DISPATCHER.dispatch(EventType.MouseReleaseEvent, **event_data)
+        if propagate_event is not None and propagate_event is False:
+            return
+
+    def on_mouse_scroll(
+        self,
+        point: np.ndarray,
+        offset: np.ndarray
+    ) -> None:
+        event_data = {"point": point, "offset": offset}
+        propagate_event = EVENT_DISPATCHER.dispatch(EventType.MouseScrollEvent, **event_data)
+        if propagate_event is not None and propagate_event is False:
+            return
+
+        frame = self.camera.frame
+        if self.window.is_key_pressed(ord(ZOOM_KEY)):
+            factor = 1 + np.arctan(10 * offset[1])
+            frame.scale(1 / factor, about_point=point)
+        else:
+            transform = frame.get_inverse_camera_rotation_matrix()
+            shift = np.dot(np.transpose(transform), offset)
+            frame.shift(-20.0 * shift)
+
+    def on_key_release(
+        self,
+        symbol: int,
+        modifiers: int
+    ) -> None:
+        event_data = {"symbol": symbol, "modifiers": modifiers}
+        propagate_event = EVENT_DISPATCHER.dispatch(EventType.KeyReleaseEvent, **event_data)
+        if propagate_event is not None and propagate_event is False:
+            return
+
+    def on_key_press(
+        self,
+        symbol: int,
+        modifiers: int
+    ) -> None:
+        try:
+            char = chr(symbol)
+        except OverflowError:
+            log.warning("The value of the pressed key is too large.")
+            return
+
+        event_data = {"symbol": symbol, "modifiers": modifiers}
+        propagate_event = EVENT_DISPATCHER.dispatch(EventType.KeyPressEvent, **event_data)
+        if propagate_event is not None and propagate_event is False:
+            return
+
+        if char == RESET_FRAME_KEY:
+            self.play(self.camera.frame.animate.to_default_state())
+        elif char == "z" and modifiers == COMMAND_MODIFIER:
+            self.undo()
+        elif char == "z" and modifiers == COMMAND_MODIFIER | SHIFT_MODIFIER:
+            self.redo()
+        # command + q
+        elif char == QUIT_KEY and modifiers == COMMAND_MODIFIER:
+            self.quit_interaction = True
+        # Space or right arrow
+        elif char == " " or symbol == ARROW_SYMBOLS[2]:
+            self.hold_on_wait = False
+
+    def on_resize(self, width: int, height: int) -> None:
+        self.camera.reset_pixel_shape(width, height)
+
+    def on_show(self) -> None:
+        pass
+
+    def on_hide(self) -> None:
+        pass
+
+    def on_close(self) -> None:
+        pass
 
 
-class EndSceneEarlyException(Exception):
+class SceneState():
+    def __init__(self, scene: Scene, ignore: list[Mobject] | None = None):
+        self.time = scene.time
+        self.num_plays = scene.num_plays
+        self.mobjects_to_copies = OrderedDict.fromkeys(scene.mobjects)
+        if ignore:
+            for mob in ignore:
+                self.mobjects_to_copies.pop(mob, None)
+
+        last_m2c = scene.undo_stack[-1].mobjects_to_copies if scene.undo_stack else dict()
+        for mob in self.mobjects_to_copies:
+            # If it hasn't changed since the last state, just point to the
+            # same copy as before
+            if mob in last_m2c and last_m2c[mob].looks_identical(mob):
+                self.mobjects_to_copies[mob] = last_m2c[mob]
+            else:
+                self.mobjects_to_copies[mob] = mob.copy()
+
+    def __eq__(self, state: SceneState):
+        return all((
+            self.time == state.time,
+            self.num_plays == state.num_plays,
+            self.mobjects_to_copies == state.mobjects_to_copies
+        ))
+
+    def mobjects_match(self, state: SceneState):
+        return self.mobjects_to_copies == state.mobjects_to_copies
+
+    def n_changes(self, state: SceneState):
+        m2c = state.mobjects_to_copies
+        return sum(
+            1 - int(mob in m2c and mob.looks_identical(m2c[mob]))
+            for mob in self.mobjects_to_copies
+        )
+
+    def restore_scene(self, scene: Scene):
+        scene.time = self.time
+        scene.num_plays = self.num_plays
+        scene.mobjects = [
+            mob.become(mob_copy)
+            for mob, mob_copy in self.mobjects_to_copies.items()
+        ]
+
+
+class EndScene(Exception):
     pass

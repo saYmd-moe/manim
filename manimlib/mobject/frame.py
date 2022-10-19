@@ -1,4 +1,5 @@
-from manimlib.constants import *
+from manimlib.constants import BLACK, GREY_E
+from manimlib.constants import FRAME_HEIGHT
 from manimlib.mobject.geometry import Rectangle
 from manimlib.utils.config_ops import digest_config
 
@@ -20,6 +21,9 @@ class ScreenRectangle(Rectangle):
 class FullScreenRectangle(ScreenRectangle):
     CONFIG = {
         "height": FRAME_HEIGHT,
+        "fill_color": GREY_E,
+        "fill_opacity": 1,
+        "stroke_width": 0,
     }
 
 
